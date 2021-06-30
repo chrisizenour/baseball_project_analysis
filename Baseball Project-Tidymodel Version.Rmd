@@ -1,0 +1,1997 @@
+---
+title: "Baseball Project "
+author: "Zach Ackerman, Osama Farooqi, Christopher Izenour, Kelley Love"
+date: "11/25/2020"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(tidyverse)
+library(tidymodels)
+library(cowplot)
+
+```
+
+
+Upload dataset
+```{r}
+
+baseball <- read.csv("C:/Users/chris/OneDrive/Desktop/R/AU Grad School/ITEC-621/ab.outcomes2.csv", header = TRUE, sep = ",")
+
+```
+
+Perform manipulations of dataset
+```{r}
+
+baseball <- baseball %>%
+  relocate(event_binary, .before = pitch_type) %>%
+  select(-home_team, -away_team)
+
+baseball.2016 <- baseball %>%
+  filter(year == 2016)
+
+baseball.2016 <-baseball.2016 %>%
+  select(-year)
+
+```
+
+Perform initial skim of data and correlation reviews. Also, change the order of the event_binary response variable level.
+```{r}
+
+library(skimr)
+skim(baseball.2016)
+
+# correlation matrix of baseball.2016 dataset prior to turning specified variables into factors
+library(corrplot)
+corrplot(baseball.2016 %>%
+           select_if(is.numeric) %>%
+           cor(), 
+         method = "shade")
+
+speed.spin.plot <- baseball.2016 %>%
+  ggplot(aes(x = start_speed, y = spin_rate)) +
+  geom_point(alpha = 0.07) +
+  geom_smooth(color = "red") +
+  labs(x = "Start Speed of Pitch (mph)",
+       y = "Spin Rate of Pitch (rpm)") +
+  theme_cowplot()
+speed.spin.plot
+
+time.pscore.plot <- baseball.2016 %>%
+  ggplot(aes(x = elapsed_time, y = p_score)) +
+  geom_point(alpha = 0.07) +
+  geom_smooth(color = "red") +
+  labs(x = "Elapsed Time of Game (minutes)",
+       y = "Score for Pitcher's Team at Time of At-bat") +
+  theme_cowplot()
+time.pscore.plot
+
+pitch.bcount.plot <- baseball.2016 %>%
+  ggplot(aes(x = pitch_num, y = b_count)) +
+  geom_point(alpha = 0.07) +
+  geom_smooth(color = "red") +
+  labs(x = "Pitch # at At-bat Outcome",
+       y = "Ball Count at At-bat Outcome") +
+  theme_cowplot()
+pitch.bcount.plot
+
+pitch.scount.plot <- baseball.2016 %>%
+  ggplot(aes(x = pitch_num, y = s_count)) +
+  geom_point(alpha = 0.07) +
+  geom_smooth(color = "red") +
+  labs(x = "Pitch # at At-bat Outcome",
+       y = "Strike Count at At-bat Outcome") +
+  theme_cowplot()
+pitch.scount.plot
+
+inning.pscore.plot <- baseball.2016 %>%
+  ggplot(aes(x = inning, y = p_score)) +
+  geom_point(alpha = 0.07) +
+  geom_smooth(color = "red") +
+  labs(x = "Inning",
+       y = "Score for Pitcher's Team at Time of At-bat") +
+  theme_cowplot()
+inning.pscore.plot
+
+# event_binary is biased towards 0 (out)
+baseball.2016 %>%
+  count(event_binary)
+
+prop.table(table(baseball.2016$event_binary))
+
+# 1 (onbase) is the second level; convert 1 to become the first level
+baseball.2016 <- baseball.2016 %>%
+  mutate(event_binary = as.factor(event_binary))
+ 
+levels(baseball.2016$event_binary)
+
+baseball.2016 <- baseball.2016 %>%
+  mutate(event_binary = fct_rev(event_binary))
+
+levels(baseball.2016$event_binary)
+
+baseball.2016 %>%
+  ggplot(aes(x = temp_f)) +
+  geom_histogram() +
+  facet_wrap(~event_binary)
+
+# convert variables to factors and then choose which are numeric
+baseball.2016 <- baseball.2016 %>%
+  drop_na() %>%
+  mutate_all(as.factor) %>%
+  mutate(start_speed = as.numeric(start_speed),
+         spin_rate = as.numeric(spin_rate),
+         px = as.numeric(px),
+         pitch_num = as.numeric(pitch_num),
+         p_score = as.numeric(p_score),
+         elapsed_time = as.numeric(elapsed_time),
+         temp_f = as.numeric(temp_f))
+skim(baseball.2016)
+
+# remove unneeded objects
+rm(baseball)
+
+
+
+```
+
+Perform data split, create test and train datasets and establish cross validation parameters
+```{r}
+
+################ Split the Data
+# Create train and test sets
+set.seed(1)
+baseball.split <- initial_split(baseball.2016, prop = .7, strata = event_binary)
+baseball.train <- training(baseball.split)
+baseball.test <- testing(baseball.split)
+
+# check distributions of base, train and test sets
+prop.table(table(baseball.2016$event_binary))
+prop.table(table(baseball.train$event_binary))
+prop.table(table(baseball.test$event_binary))
+  
+# Create resampling object
+# Use k-fold cross validation
+# 5 folds, repeated 1, stratified by the response variable event_binary
+set.seed(1)
+k.folds <- vfold_cv(baseball.train, v = 5, repeats = 1, strata = event_binary)
+k.folds
+
+
+```
+
+Establish model specifications. 
+```{r}
+
+################ Model Specifications
+
+# Binary Classification model specification
+tree.specification <- decision_tree() %>%
+  set_args(cost_complexity = tune(),
+           tree_depth = tune(),
+           min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification") %>%
+  translate()
+tree.specification
+
+# Logistic Regression (glm) model specification
+glm.specification <-logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification") %>%
+  translate()
+glm.specification
+
+# Penalized Logistic Regression (LASSO) (glmnet)
+lasso.specification <- logistic_reg() %>%
+  set_args(penalty = tune(),
+           mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification") %>%
+  translate()
+lasso.specification
+
+```
+
+Establish Recipes - All predictors
+```{r}
+
+################### Recipe for each model
+
+# Preprocessing and establishing the recipe
+
+# Tree Recipe
+tree.recipe <- recipe(event_binary ~., data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+#  step_center(all_predictors()) %>%
+#  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+tree.recipe
+
+tree.prepped <- prep(tree.recipe, training = baseball.train)
+tree.prepped
+
+# Logistic Regression (glm) Recipe
+glm.recipe <- recipe(event_binary ~., data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+glm.recipe
+
+glm.prepped <- prep(glm.recipe, training = baseball.train)
+glm.prepped
+
+# Penalized Logistic Regression (LASSO) (glmnet) Recipe
+lasso.recipe <- recipe(event_binary ~., data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+lasso.recipe
+
+lasso.prepped <- prep(lasso.recipe, training = baseball.train)
+lasso.prepped
+
+```
+
+Establish workflow objects
+```{r}
+
+##################### Workflows
+
+# Tree Workflow
+tree.workflow <- workflow() %>%
+  add_model(tree.specification) %>%
+  add_recipe(tree.recipe)
+tree.workflow
+  
+
+# Logistic Regression (glm) Workflow
+glm.workflow <- workflow() %>%
+  add_model(glm.specification) %>%
+  add_recipe(glm.recipe)
+glm.workflow
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) Workflow
+lasso.workflow <- workflow() %>%
+  add_model(lasso.specification) %>%
+  add_recipe(lasso.recipe)
+lasso.workflow
+
+```
+
+
+Establish Tuning Grids
+```{r}
+
+############## Tuning Grids
+
+# Tree Tuning Grid
+tree.grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(),
+                          levels = 4)
+tree.grid
+
+# Logistic Regression (glm) Grid
+# There are no tuning parameters in the standard glm logistic regression model to tune
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) Grid
+lambda.grid <- grid_regular(penalty(),
+                            levels = 100)
+lambda.grid
+
+```
+
+Establish metrics object
+```{r}
+
+################### Metrics
+
+# establish object for the metrics we'll want
+baseball.metrics <- metric_set(accuracy,
+                               sens,
+                               spec,
+                               roc_auc,
+                               mn_log_loss)
+
+```
+
+Establish Model Control objects
+```{r}
+
+##################### Model Control
+
+# Model control for specifications that have grids for tunable parameters
+control.grid <- control_grid(save_pred = TRUE, verbose = TRUE)
+
+# Model control for specifications that do not need grids because they have no tunable parameters
+control.nogrid <- control_resamples(save_pred = TRUE, verbose = TRUE)
+
+```
+
+
+
+Train and Tune models
+```{r}
+
+##################### Train and Tune Models
+
+# Tree
+tree.results <- tree.workflow %>%
+  tune_grid(resamples = k.folds,
+            grid = tree.grid,
+            metrics = baseball.metrics,
+            control = control.grid)
+tree.results
+
+# Logistic Regression (glm)
+glm.results <- glm.workflow %>%
+  fit_resamples(resamples = k.folds,
+                metrics = baseball.metrics,
+                control = control.nogrid)
+glm.results
+
+# Penalized Logistic Regression (LASSO)
+lasso.results <- lasso.workflow %>%
+  tune_grid(resamples = k.folds,
+            grid = lambda.grid,
+            metrics = baseball.metrics,
+            control = control.grid)
+lasso.results
+
+```
+
+Collect and observe metrics of tunings
+```{r}
+
+###################### Collect Metrics from model results
+
+# Tree Model Results
+tree.results %>%
+  collect_metrics()
+
+# Logistic Regression (glm) Results
+glm.results %>%
+  collect_metrics()
+
+# Penalized Logistic Regression (LASSO) (glmnet)
+lasso.results %>%
+  collect_metrics()
+
+```
+
+Explore model tunings
+```{r}
+
+###################### Exploring Model Tunings
+
+# Tree Model
+
+tree.results %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1, alpha = .7) +
+  geom_point(size = 1)+
+  facet_wrap(~.metric, scales = "free") +
+  theme_cowplot()
+
+autoplot(tree.results)
+
+tree.results %>%
+  show_best()
+
+tree.results %>%
+  select_best()
+
+tree.results %>%
+  show_best("roc_auc")
+
+tree.results %>%
+  select_best("roc_auc")
+
+# Logistic Regression (glm)
+glm.results %>%
+  collect_metrics 
+
+# Penalized Logistic Regression (LASSO) (glmnet)
+lasso.results %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = .5) +
+  geom_line(size = .6) +
+  facet_wrap(~.metric, scales = "free") +
+  scale_x_log10() +
+  theme_cowplot()
+
+lasso.auc.penalty.plot <- lasso.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  ggplot(aes(x = penalty, y = mean)) +
+  geom_point() +
+  geom_line() +
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = label_number())+
+  theme_cowplot()
+lasso.auc.penalty.plot
+
+autoplot(lasso.results) +
+  theme_cowplot()
+
+lasso.results %>%
+  show_best("roc_auc", n = 10) %>%
+  arrange(penalty)
+
+lasso.results %>%
+  select_best("roc_auc")
+
+```
+
+Compare ROC Curves of the three models
+```{r}
+
+################## ROC Curve Comparison
+roc.curve.plot <- tree.results %>%
+  unnest(.predictions) %>%
+  mutate(model = "tree") %>%
+  bind_rows(glm.results %>%
+              unnest(.predictions) %>%
+              mutate(model = "glm")) %>%
+  bind_rows(lasso.results %>%
+              unnest(.predictions) %>%
+              mutate(model = "lasso")) %>%
+  group_by(model) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1.2) +
+  geom_abline(lty = 2, alpha = .7, color = "gray50", size = 1.2) +
+  theme_cowplot()
+roc.curve.plot
+
+```
+
+Create confusion matrices for the three models based on the tunings and training data
+```{r}
+
+################### Confusion Matrix @ the 0.5 threshold
+
+
+# Tree Model
+tree.conf.mat <- tree.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.conf.mat
+
+
+# Logistic Regression Model (glm)
+glm.conf.mat <-glm.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.conf.mat
+
+
+
+# Penalized Logistic Regression Model (LASSO) (glmnet)
+lasso.conf.mat <- lasso.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.conf.mat
+
+```
+
+Create confusion matrices for the three models based on the tunings and training data
+```{r}
+
+################### Confusion Matrix @ the 0.3 threshold
+
+
+# Tree Model
+tree.conf.mat.3 <- tree.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.conf.mat.3
+
+
+# Logistic Regression Model (glm)
+glm.conf.mat.3 <-glm.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.conf.mat.3
+
+
+
+# Penalized Logistic Regression Model (LASSO) (glmnet)
+lasso.conf.mat.3 <- lasso.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.conf.mat.3
+
+```
+
+
+Select best parameters from tuning stage
+```{r}
+
+##################### Select best model according to accuracy metric
+
+# Tree model
+tree.best.parameters <- tree.results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  slice_max(mean, with_ties = FALSE)
+tree.best.parameters
+
+# Logistic Regression (glm) model
+# NA as there are no tunable parameters for the glm
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.best.parameters <- lasso.results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  slice_max(mean, with_ties = FALSE)
+lasso.best.parameters
+
+```
+
+Select Best AUCs for each model from tuning stage
+```{r}
+
+##################### Select best model according to roc_auc metricc
+
+# Tree model
+tree.best.auc <- tree.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+tree.best.auc
+
+tree.auc <- tree.results %>%
+  collect_predictions(parameter = tree.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "Tree")
+
+# Logistic Regression (glm) model
+glm.best.auc <- glm.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+glm.best.auc
+
+glm.auc <- glm.results %>%
+  collect_predictions(parameter = glm.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "GLM")
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.best.auc <- lasso.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+lasso.best.auc
+
+lasso.auc <- lasso.results %>%
+  collect_predictions(parameter = lasso.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "LASSO")
+
+bind_rows(tree.auc, glm.auc, lasso.auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.1, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+
+
+```
+
+The LAST FIT
+
+The best parameters for each model, where applicable
+```{r}
+
+############################### The best paramterers per model
+
+# Tree
+tree.best.parameters
+
+# Logistic Regression (glm) model
+# not applicable
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.best.parameters
+
+
+```
+
+
+The Last Model
+
+
+Update workflows with the best parameters from tuning stage
+```{r}
+
+################################### Update workflows with best parameters
+
+# Tree model
+tree.final.workflow <- tree.workflow %>%
+  finalize_workflow(tree.best.parameters)
+tree.final.workflow
+
+# Logistic Regression (glm) model
+# NA as there is no tuned parameter to load into the model
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.final.workflow <- lasso.workflow %>%
+  finalize_workflow(lasso.best.parameters)
+lasso.final.workflow
+
+```
+
+Fit final model to the training data
+```{r}
+
+##################################### Fitting the final model to the training data
+
+# Tree model
+tree.final <- tree.final.workflow %>%
+  fit(data = baseball.train)
+tree.final
+
+# Logistic Regression (glm) model
+glm.final <- glm.workflow %>%
+  fit(data = baseball.train)
+glm.final
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.final <- lasso.final.workflow %>%
+  fit(data = baseball.train)
+lasso.final
+
+```
+
+
+Extract final models
+```{r}
+
+################################### Extract final models
+
+library(vip)
+
+# Tree model
+vi(tree.fit)
+
+tree.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+tree.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+library(rpart)
+library(rpart.plot)
+tree.plot <- tree.final %>%
+  pull_workflow_fit()
+rpart.plot(tree.plot$fit)
+
+tree.model.fit <- pull_workflow_fit(tree.final)$fit
+tree.model.fit
+
+# Logistic Regression (glm) model
+glm.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+glm.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+glm.final %>%
+  pull_workflow_fit() %>%
+  tidy(exponentiate = TRUE) %>%
+  arrange(estimate)
+
+glm.model.fit <- pull_workflow_fit(glm.final)$fit
+glm.model.fit
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+lasso.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+lasso.final %>%
+  pull_workflow_fit() %>%
+  tidy(exponentiate = TRUE) %>%
+  arrange(estimate)
+
+lasso.model.fit <- pull_workflow_fit(lasso.final)$fit
+lasso.model.fit
+
+
+```
+
+
+THE LAST FIT
+
+Evaluate models with the test set
+```{r}
+
+####################### Evaluate mdoels on the test set
+
+# Tree model
+tree.last.fit <- tree.final.workflow %>%
+  last_fit(baseball.split)
+tree.last.fit
+
+# Logistic Regression (glm) model
+glm.last.fit <- glm.workflow %>%
+  last_fit(baseball.split)
+glm.last.fit
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.last.fit <- lasso.final.workflow %>%
+  last_fit(baseball.split)
+lasso.last.fit
+
+```
+
+
+Review how the models performed with the test set
+```{r}
+
+##################### Review Test Performances
+
+# Tree model
+tree.test.performance <- tree.last.fit %>%
+  collect_metrics()
+tree.test.performance
+
+# Logistic Regression (glm) model
+glm.test.performance <- glm.last.fit %>%
+  collect_metrics()
+glm.test.performance
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.performance <- lasso.last.fit %>%
+  collect_metrics()
+lasso.test.performance
+
+```
+
+Compare ROC Curves of the three models
+```{r}
+
+roc.curve.full.models.test.data <- tree.last.fit %>%
+  unnest(.predictions) %>%
+  mutate(model = "Tree") %>%
+  bind_rows(glm.last.fit %>%
+              unnest(.predictions) %>%
+              mutate(model = "GLM")) %>%
+  bind_rows(lasso.last.fit %>%
+              unnest(.predictions) %>%
+              mutate(model = "LASSO")) %>%
+  group_by(model) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1.2) +
+  geom_abline(lty = 2, alpha = .7, color = "gray50", size = 1.2) +
+  theme_cowplot()
+roc.curve.full.models.test.data
+
+
+
+```
+
+
+Create confusion matrices based on test data performances. Threshold @ 0.5
+```{r}
+
+######################### Test Confusion Matrices @ 0.5 Threshold
+
+# Tree model
+tree.test.conf.mat.5 <- tree.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.test.conf.mat.5
+
+
+# Logistic Regression (glm) model
+glm.test.conf.mat.5 <- glm.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.test.conf.mat.5
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.conf.mat.5 <- lasso.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.test.conf.mat.5
+
+```
+
+Confusion Matrix-related metrics. Threshold @ 0.5
+```{r}
+
+# Tree Model
+tree.test.conf.mat.5.metrics <- tree.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+tree.test.conf.mat.5.metrics
+
+
+# Logistic Regression (glm) model
+glm.test.conf.mat.5.metrics <- glm.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+glm.test.conf.mat.5.metrics
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.conf.mat.5.metrics <- lasso.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+lasso.test.conf.mat.5.metrics
+
+
+
+```
+
+Create confusion matrices based on test data performances. Threshold @ 0.3
+```{r}
+
+######################### Test Confusion Matrices @ 0.3 Threshold
+
+# Tree model
+tree.test.conf.mat.3 <- tree.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.test.conf.mat.3
+
+
+# Logistic Regression (glm) model
+glm.test.conf.mat.3 <- glm.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.test.conf.mat.3
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.conf.mat.3 <- lasso.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.test.conf.mat.3
+
+```
+
+Confusion Matrix-related metrics. Threshold @ 0.3
+```{r}
+
+# Tree Model
+tree.test.conf.mat.3.metrics <- tree.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+tree.test.conf.mat.3.metrics
+
+
+# Logistic Regression (glm) model
+glm.test.conf.mat.3.metrics <- glm.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+glm.test.conf.mat.3.metrics
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.conf.mat.3.metrics <- lasso.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+lasso.test.conf.mat.3.metrics
+
+
+
+```
+
+Observe probability distributions by class
+```{r}
+
+######################### Test Prediction Probability Distributions by class
+
+# Tree model
+tree.test.predictions <- tree.last.fit %>% collect_predictions() 
+tree.test.predictions
+
+tree.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+# Logistic Regression (glm) model
+glm.test.predictions <- glm.last.fit %>% collect_predictions()
+glm.test.predictions
+
+glm.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.test.predictions <- lasso.last.fit %>% collect_predictions()
+lasso.test.predictions
+
+lasso.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+```
+
+
+
+
+Establish Recipes - reduced predictors
+```{r}
+
+################### Recipe for each model
+
+# Preprocessing and establishing the recipe
+
+# Tree Recipe
+tree.reduced.recipe <- recipe(event_binary ~ pitch_type + outs + on_3b + pitch_num + top_of_inning + night_game + conditions_updated + b_count + s_count + start_speed + p_score + elapsed_time, data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+tree.reduced.recipe
+
+tree.reduced.prepped <- prep(tree.reduced.recipe, training = baseball.train)
+tree.reduced.prepped
+
+# Logistic Regression (glm) Recipe
+glm.reduced.recipe <- recipe(event_binary ~ pitch_type + outs + on_3b + pitch_num + top_of_inning + night_game + conditions_updated + b_count + s_count + start_speed + p_score + elapsed_time, data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+glm.reduced.recipe
+
+glm.reduced.prepped <- prep(glm.reduced.recipe, training = baseball.train)
+glm.reduced.prepped
+
+# Penalized Logistic Regression (LASSO) (glmnet) Recipe
+lasso.reduced.recipe <- recipe(event_binary ~ pitch_type + outs + on_3b + pitch_num + top_of_inning + night_game + conditions_updated + b_count + s_count + start_speed + p_score + elapsed_time, data = baseball.train) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors())
+lasso.reduced.recipe
+
+lasso.reduced.prepped <- prep(lasso.reduced.recipe, training = baseball.train)
+lasso.reduced.prepped
+
+```
+
+Establish workflow objects
+```{r}
+
+##################### Workflows
+
+# Tree Workflow
+tree.reduced.workflow <- workflow() %>%
+  add_model(tree.specification) %>%
+  add_recipe(tree.reduced.recipe)
+tree.workflow
+  
+
+# Logistic Regression (glm) Workflow
+glm.reduced.workflow <- workflow() %>%
+  add_model(glm.specification) %>%
+  add_recipe(glm.reduced.recipe)
+glm.reduced.workflow
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) Workflow
+lasso.reduced.workflow <- workflow() %>%
+  add_model(lasso.specification) %>%
+  add_recipe(lasso.reduced.recipe)
+lasso.reduced.workflow
+
+```
+
+
+Establish Tuning Grids
+```{r}
+
+############## Tuning Grids
+
+# Tree Tuning Grid
+tree.reduced.grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(),
+                          levels = 4)
+tree.reduced.grid
+
+# Logistic Regression (glm) Grid
+# There are no tuning parameters in the standard glm logistic regression model to tune
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) Grid
+lambda.reduced.grid <- grid_regular(penalty(),
+                            levels = 100)
+lambda.reduced.grid
+
+```
+
+Establish metrics object
+```{r}
+
+################### Metrics
+
+# establish object for the metrics we'll want
+baseball.reduced.metrics <- metric_set(accuracy,
+                               sens,
+                               spec,
+                               roc_auc,
+                               mn_log_loss)
+
+```
+
+Establish Model Control objects
+```{r}
+
+##################### Model Control
+
+# Model control for specifications that have grids for tunable parameters
+control.grid <- control_grid(save_pred = TRUE, verbose = TRUE)
+
+# Model control for specifications that do not need grids because they have no tunable parameters
+control.nogrid <- control_resamples(save_pred = TRUE, verbose = TRUE)
+
+```
+
+
+
+Train and Tune models
+```{r}
+
+##################### Train and Tune Models
+
+# Tree
+tree.reduced.results <- tree.reduced.workflow %>%
+  tune_grid(resamples = k.folds,
+            grid = tree.reduced.grid,
+            metrics = baseball.reduced.metrics,
+            control = control.grid)
+tree.reduced.results
+
+# Logistic Regression (glm)
+glm.reduced.results <- glm.reduced.workflow %>%
+  fit_resamples(resamples = k.folds,
+                metrics = baseball.reduced.metrics,
+                control = control.nogrid)
+glm.reduced.results
+
+# Penalized Logistic Regression (LASSO)
+lasso.reduced.results <- lasso.reduced.workflow %>%
+  tune_grid(resamples = k.folds,
+            grid = lambda.reduced.grid,
+            metrics = baseball.reduced.metrics,
+            control = control.grid)
+lasso.reduced.results
+
+```
+
+Collect and observe metrics of tunings
+```{r}
+
+###################### Collect Metrics from model results
+
+# Tree Model Results
+tree.reduced.results %>%
+  collect_metrics()
+
+# Logistic Regression (glm) Results
+glm.reduced.results %>%
+  collect_metrics()
+
+# Penalized Logistic Regression (LASSO) (glmnet)
+lasso.reduced.results %>%
+  collect_metrics()
+
+```
+
+Explore model tunings
+```{r}
+
+###################### Exploring Model Tunings
+
+# Tree Model
+
+tree.reduced.results %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1, alpha = .7) +
+  geom_point(size = 1)+
+  facet_wrap(~.metric, scales = "free") +
+  theme_cowplot()
+
+autoplot(tree.reduced.results)
+
+tree.reduced.results %>%
+  show_best()
+
+tree.reduced.results %>%
+  select_best()
+
+tree.reduced.results %>%
+  show_best("roc_auc")
+
+tree.reduced.results %>%
+  select_best("roc_auc")
+
+# Logistic Regression (glm)
+glm.reduced.results %>%
+  collect_metrics 
+
+# Penalized Logistic Regression (LASSO) (glmnet)
+lasso.reduced.results %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = .5) +
+  geom_line(size = .6) +
+  facet_wrap(~.metric, scales = "free") +
+  scale_x_log10() +
+  theme_cowplot()
+
+lasso.reduced.auc.penalty.plot <- lasso.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  ggplot(aes(x = penalty, y = mean)) +
+  geom_point() +
+  geom_line() +
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = label_number())+
+  theme_cowplot()
+lasso.auc.penalty.plot
+
+autoplot(lasso.reduced.results) +
+  theme_cowplot()
+
+lasso.reduced.results %>%
+  show_best("roc_auc", n = 10) %>%
+  arrange(penalty)
+
+lasso.reduced.results %>%
+  select_best("roc_auc")
+
+```
+
+Compare ROC Curves of the three models
+```{r}
+
+################## ROC Curve Comparison
+reduced.roc.curve.plot <- tree.reduced.results %>%
+  unnest(.predictions) %>%
+  mutate(model = "tree") %>%
+  bind_rows(glm.reduced.results %>%
+              unnest(.predictions) %>%
+              mutate(model = "glm")) %>%
+  bind_rows(lasso.reduced.results %>%
+              unnest(.predictions) %>%
+              mutate(model = "lasso")) %>%
+  group_by(model) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1.2) +
+  geom_abline(lty = 2, alpha = .7, color = "gray50", size = 1.2) +
+  theme_cowplot()
+reduced.roc.curve.plot
+
+```
+
+Create confusion matrices for the three models based on the tunings and training data
+```{r}
+
+################### Confusion Matrix @ the 0.5 threshold
+
+
+# Tree Model
+tree.reduced.conf.mat <- tree.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.reduced.conf.mat
+
+
+# Logistic Regression Model (glm)
+glm.reduced.conf.mat <-glm.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.reduced.conf.mat
+
+
+
+# Penalized Logistic Regression Model (LASSO) (glmnet)
+lasso.reduced.conf.mat <- lasso.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.reduced.conf.mat
+
+```
+
+Create confusion matrices for the three models based on the tunings and training data
+```{r}
+
+################### Confusion Matrix @ the 0.3 threshold
+
+
+# Tree Model
+tree.reduced.conf.mat.3 <- tree.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.reduced.conf.mat.3
+
+
+# Logistic Regression Model (glm)
+glm.reduced.conf.mat.3 <-glm.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.reduced.conf.mat.3
+
+
+
+# Penalized Logistic Regression Model (LASSO) (glmnet)
+lasso.reduced.conf.mat.3 <- lasso.reduced.results %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.reduced.conf.mat.3
+
+```
+
+
+Select best parameters from tuning stage
+```{r}
+
+##################### Select best model according to accuracy metric
+
+# Tree model
+tree.reduced.best.parameters <- tree.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  slice_max(mean, with_ties = FALSE)
+tree.reduced.best.parameters
+
+# Logistic Regression (glm) model
+# NA as there are no tunable parameters for the glm
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.best.parameters <- lasso.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  slice_max(mean, with_ties = FALSE)
+lasso.reduced.best.parameters
+
+```
+
+Select Best AUCs for each model from tuning stage
+```{r}
+
+##################### Select best model according to roc_auc metricc
+
+# Tree model
+tree.reduced.best.auc <- tree.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+tree.reduced.best.auc
+
+tree.reduced.auc <- tree.reduced.results %>%
+  collect_predictions(parameter = tree.reduced.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "Tree")
+
+# Logistic Regression (glm) model
+glm.reduced.best.auc <- glm.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+glm.reduced.best.auc
+
+glm.reduced.auc <- glm.reduced.results %>%
+  collect_predictions(parameter = glm.reduced.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "GLM")
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.best.auc <- lasso.reduced.results %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  slice_max(mean, with_ties = FALSE)
+lasso.reduced.best.auc
+
+lasso.reduced.auc <- lasso.reduced.results %>%
+  collect_predictions(parameter = lasso.reduced.best.auc) %>%
+  roc_curve(event_binary, .pred_1) %>%
+  mutate(model = "LASSO")
+
+bind_rows(tree.reduced.auc, glm.reduced.auc, lasso.reduced.auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.1, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+
+
+```
+
+The LAST FIT
+
+The best parameters for each model, where applicable
+```{r}
+
+############################### The best paramterers per model
+
+# Tree
+tree.reduced.best.parameters
+
+# Logistic Regression (glm) model
+# not applicable
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.best.parameters
+
+
+```
+
+
+The Last Model
+
+
+Update workflows with the best parameters from tuning stage
+```{r}
+
+################################### Update workflows with best parameters
+
+# Tree model
+tree.reduced.final.workflow <- tree.reduced.workflow %>%
+  finalize_workflow(tree.reduced.best.parameters)
+tree.reduced.final.workflow
+
+# Logistic Regression (glm) model
+# NA as there is no tuned parameter to load into the model
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.final.workflow <- lasso.reduced.workflow %>%
+  finalize_workflow(lasso.reduced.best.parameters)
+lasso.reduced.final.workflow
+
+```
+
+Fit final model to the training data
+```{r}
+
+##################################### Fitting the final model to the training data
+
+# Tree model
+tree.reduced.final <- tree.reduced.final.workflow %>%
+  fit(data = baseball.train)
+tree.reduced.final
+
+# Logistic Regression (glm) model
+glm.reduced.final <- glm.reduced.workflow %>%
+  fit(data = baseball.train)
+glm.reduced.final
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.final <- lasso.reduced.final.workflow %>%
+  fit(data = baseball.train)
+lasso.reduced.final
+
+```
+
+
+Extract final models
+```{r}
+
+################################### Extract final models
+
+library(vip)
+
+# Tree model
+# vi(tree.reduced.fit)
+
+tree.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+tree.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+library(rpart)
+library(rpart.plot)
+tree.reduced.plot <- tree.reduced.final %>%
+  pull_workflow_fit()
+rpart.plot(tree.plot$fit)
+
+tree.reduced.model.fit <- pull_workflow_fit(tree.reduced.final)$fit
+tree.reduced.model.fit
+
+# Logistic Regression (glm) model
+glm.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+glm.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+glm.reduced.final %>%
+  pull_workflow_fit() %>%
+  tidy(exponentiate = TRUE) %>%
+  arrange(estimate)
+
+glm.reduced.model.fit <- pull_workflow_fit(glm.reduced.final)$fit
+glm.reduced.model.fit
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip()
+
+lasso.reduced.final %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+
+lasso.reduced.final %>%
+  pull_workflow_fit() %>%
+  tidy(exponentiate = TRUE) %>%
+  arrange(estimate)
+
+lasso.reduced.model.fit <- pull_workflow_fit(lasso.reduced.final)$fit
+lasso.reduced.model.fit
+
+
+```
+
+
+THE LAST FIT
+
+Evaluate models with the test set
+```{r}
+
+####################### Evaluate mdoels on the test set
+
+# Tree model
+tree.reduced.last.fit <- tree.reduced.final.workflow %>%
+  last_fit(baseball.split)
+tree.reduced.last.fit
+
+# Logistic Regression (glm) model
+glm.reduced.last.fit <- glm.reduced.workflow %>%
+  last_fit(baseball.split)
+glm.reduced.last.fit
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.last.fit <- lasso.reduced.final.workflow %>%
+  last_fit(baseball.split)
+lasso.reduced.last.fit
+
+```
+
+
+Review how the models performed with the test set
+```{r}
+
+##################### Review Test Performances
+
+# Tree model
+tree.reduced.test.performance <- tree.reduced.last.fit %>%
+  collect_metrics()
+tree.reduced.test.performance
+
+# Logistic Regression (glm) model
+glm.reduced.test.performance <- glm.reduced.last.fit %>%
+  collect_metrics()
+glm.reduced.test.performance
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.performance <- lasso.reduced.last.fit %>%
+  collect_metrics()
+lasso.reduced.test.performance
+
+```
+
+Create confusion matrices based on test data performances. Threshold @ 0.5
+```{r}
+
+######################### Test Confusion Matrices @ 0.5 Threshold
+
+# Tree model
+tree.reduced.test.conf.mat.5 <- tree.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.reduced.test.conf.mat.5
+
+
+# Logistic Regression (glm) model
+glm.reduced.test.conf.mat.5 <- glm.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.reduced.test.conf.mat.5
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.conf.mat.5 <- lasso.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.reduced.test.conf.mat.5
+
+```
+
+Confusion Matrix-related metrics. Threshold @ 0.5
+```{r}
+
+# Tree Model
+tree.reduced.test.conf.mat.5.metrics <- tree.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+tree.reduced.test.conf.mat.5.metrics
+
+
+# Logistic Regression (glm) model
+glm.reduced.test.conf.mat.5.metrics <- glm.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+glm.reduced.test.conf.mat.5.metrics
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.conf.mat.5.metrics <- lasso.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .5, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+lasso.reduced.test.conf.mat.5.metrics
+
+
+
+```
+
+Create confusion matrices based on test data performances. Threshold @ 0.3
+```{r}
+
+######################### Test Confusion Matrices @ 0.3 Threshold
+
+# Tree model
+tree.reduced.test.conf.mat.3 <- tree.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+tree.reduced.test.conf.mat.3
+
+
+# Logistic Regression (glm) model
+glm.reduced.test.conf.mat.3 <- glm.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+glm.reduced.test.conf.mat.3
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.conf.mat.3 <- lasso.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(event_binary, pred)
+lasso.reduced.test.conf.mat.3
+
+```
+
+Confusion Matrix-related metrics. Threshold @ 0.3
+```{r}
+
+# Tree Model
+tree.reduced.test.conf.mat.3.metrics <- tree.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+tree.reduced.test.conf.mat.3.metrics
+
+
+# Logistic Regression (glm) model
+glm.reduced.test.conf.mat.3.metrics <- glm.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+glm.reduced.test.conf.mat.3.metrics
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.conf.mat.3.metrics <- lasso.reduced.last.fit %>%
+  collect_predictions() %>%
+  mutate(pred = if_else(.pred_1 >= .3, 1, 0),
+         pred = as.factor(pred),
+         pred = fct_rev(pred)) %>%
+  conf_mat(truth = "event_binary", estimate = ".pred_class") %>%
+  summary()
+lasso.reduced.test.conf.mat.3.metrics
+
+
+
+```
+
+Observe probability distributions by class
+```{r}
+
+######################### Test Prediction Probability Distributions by class
+
+# Tree model
+tree.reduced.test.predictions <- tree.reduced.last.fit %>% collect_predictions() 
+tree.reduced.test.predictions
+
+tree.reduced.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+# Logistic Regression (glm) model
+glm.reduced.test.predictions <- glm.reduced.last.fit %>% collect_predictions()
+glm.reduced.test.predictions
+
+glm.reduced.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.reduced.test.predictions <- lasso.reduced.last.fit %>% collect_predictions()
+lasso.reduced.test.predictions
+
+lasso.reduced.test.predictions %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = event_binary), alpha = 0.5) +
+  theme_cowplot()
+
+```
+
+Training and Test Set Comparison @ 0.5 Threshold
+```{r}
+# Tree Model
+# Full Model
+# Training Set
+tree.results %>% collect_metrics()
+tree.results %>% collect_predictions()
+tree.conf.mat
+
+# Test Set
+tree.last.fit %>% collect_metrics()
+tree.last.fit %>% collect_predictions()
+tree.test.conf.mat.5
+tree.test.conf.mat.5.metrics
+
+# Tree Model
+# Reduced Model
+# Training Set
+tree.reduced.results %>% collect_metrics()
+tree.reduced.results %>% collect_predictions()
+tree.reduced.conf.mat
+
+# Test Set
+tree.reduced.last.fit %>% collect_metrics()
+tree.reduced.last.fit %>% collect_predictions()
+tree.reduced.test.conf.mat.5
+tree.reduced.test.conf.mat.5.metrics
+
+
+
+
+
+
+
+
+
+# Logistic Regression (glm) Model
+# Full Model
+# Training Set
+glm.results %>% collect_metrics()
+glm.results %>% collect_predictions()
+glm.conf.mat
+
+# Test Set
+glm.last.fit %>% collect_metrics()
+glm.last.fit %>% collect_predictions()
+glm.test.conf.mat.5
+glm.test.conf.mat.5.metrics
+
+# Logistic Regression (glm) Model
+# Reduced Model
+# Training Set
+glm.reduced.results %>% collect_metrics()
+glm.reduced.results %>% collect_predictions()
+glm.reduced.conf.mat
+
+# Test Set
+glm.reduced.last.fit %>% collect_metrics()
+glm.reduced.last.fit %>% collect_predictions()
+glm.reduced.test.conf.mat.5
+glm.reduced.test.conf.mat.5.metrics
+
+
+
+
+
+
+
+# Penalized Logistic Regression (glmnet) Model
+# Full Model
+# Training Set
+lasso.results %>% collect_metrics()
+lasso.results %>% collect_predictions()
+lasso.conf.mat
+
+# Test Set
+lasso.last.fit %>% collect_metrics()
+lasso.last.fit %>% collect_predictions()
+lasso.test.conf.mat.5
+lasso.test.conf.mat.5.metrics
+
+# Penalized Logistic Regression (glmnet) Model
+# Reduced Model
+# Training Set
+lasso.reduced.results %>% collect_metrics()
+lasso.reduced.results %>% collect_predictions()
+lasso.reduced.conf.mat
+
+# Test Set
+lasso.reduced.last.fit %>% collect_metrics()
+lasso.reduced.last.fit %>% collect_predictions()
+lasso.reduced.test.conf.mat.5
+lasso.reduced.test.conf.mat.5.metrics
+
+
+
+```
+
+
+
+
+
+
+
+Evaulate Models on Entire Dataset
+```{r}
+
+# Tree Model
+tree.last.fit.entire.dataset.results <- predict(tree.final, new_data = baseball.2016 %>% select(-event_binary))
+tree.last.fit.entire.dataset.results
+tree.last.fit.entire.dataset.results <- bind_cols(tree.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+tree.last.fit.entire.dataset.results
+tree.last.fit.entire.dataset.conf_mat <- conf_mat(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+tree.last.fit.entire.dataset.conf_mat
+tree.last.fit.entire.dataset.mcc <- mcc(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.last.fit.entire.dataset.accuracy <- accuracy(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.last.fit.entire.dataset.spec <- spec(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.last.fit.entire.dataset.sens  <- sens(tree.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.last.fit.entire.dataset.metrics <- bind_rows(tree.last.fit.entire.dataset.mcc, tree.last.fit.entire.dataset.accuracy, tree.last.fit.entire.dataset.bal.accuracy, tree.last.fit.entire.dataset.spec, tree.last.fit.entire.dataset.sens)
+tree.last.fit.entire.dataset.metrics
+
+tree.reduced.last.fit.entire.dataset.results <- predict(tree.reduced.final, new_data = baseball.2016 %>% select(-event_binary))
+tree.reduced.last.fit.entire.dataset.results
+tree.reduced.last.fit.entire.dataset.results <- bind_cols(tree.reduced.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+tree.reduced.last.fit.entire.dataset.results
+tree.reduced.last.fit.entire.dataset.conf_mat <- conf_mat(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+tree.reduced.last.fit.entire.dataset.conf_mat
+tree.reduced.last.fit.entire.dataset.mcc <- mcc(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.reduced.last.fit.entire.dataset.accuracy <- accuracy(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.reduced.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.reduced.last.fit.entire.dataset.spec <- spec(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.reduced.last.fit.entire.dataset.sens  <- sens(tree.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+tree.reduced.last.fit.entire.dataset.metrics <- bind_rows(tree.reduced.last.fit.entire.dataset.mcc, tree.reduced.last.fit.entire.dataset.accuracy, tree.reduced.last.fit.entire.dataset.bal.accuracy, tree.reduced.last.fit.entire.dataset.spec, tree.reduced.last.fit.entire.dataset.sens)
+tree.reduced.last.fit.entire.dataset.metrics
+
+tree.full.reduced.entire.dataset.metrics <- left_join(tree.last.fit.entire.dataset.metrics, tree.reduced.last.fit.entire.dataset.metrics, by = ".metric") %>% rename(Classification_Metric = .metric, Full_Model = .estimate.x, Reduced_Model = .estimate.y)
+tree.full.reduced.entire.dataset.metrics
+
+# Logistic Regression (glm) model
+glm.last.fit.entire.dataset.results <- predict(glm.final, new_data = baseball.2016 %>% select(-event_binary))
+glm.last.fit.entire.dataset.results
+glm.last.fit.entire.dataset.results <- bind_cols(glm.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+glm.last.fit.entire.dataset.results
+glm.last.fit.entire.dataset.conf_mat <- conf_mat(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+glm.last.fit.entire.dataset.conf_mat
+glm.last.fit.entire.dataset.mcc <- mcc(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.last.fit.entire.dataset.accuracy <- accuracy(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.last.fit.entire.dataset.spec <- spec(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.last.fit.entire.dataset.sens  <- sens(glm.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.last.fit.entire.dataset.metrics <- bind_rows(glm.last.fit.entire.dataset.mcc, glm.last.fit.entire.dataset.accuracy, glm.last.fit.entire.dataset.bal.accuracy, glm.last.fit.entire.dataset.spec, glm.last.fit.entire.dataset.sens)
+glm.last.fit.entire.dataset.metrics
+
+glm.reduced.last.fit.entire.dataset.results <- predict(glm.reduced.final, new_data = baseball.2016 %>% select(-event_binary))
+glm.reduced.last.fit.entire.dataset.results
+glm.reduced.last.fit.entire.dataset.results <- bind_cols(glm.reduced.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+glm.reduced.last.fit.entire.dataset.results
+glm.reduced.last.fit.entire.dataset.conf_mat <- conf_mat(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+glm.reduced.last.fit.entire.dataset.conf_mat
+glm.reduced.last.fit.entire.dataset.mcc <- mcc(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.reduced.last.fit.entire.dataset.accuracy <- accuracy(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.reduced.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.reduced.last.fit.entire.dataset.spec <- spec(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.reduced.last.fit.entire.dataset.sens  <- sens(glm.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+glm.reduced.last.fit.entire.dataset.metrics <- bind_rows(glm.reduced.last.fit.entire.dataset.mcc, glm.reduced.last.fit.entire.dataset.accuracy, glm.reduced.last.fit.entire.dataset.bal.accuracy, glm.reduced.last.fit.entire.dataset.spec, glm.reduced.last.fit.entire.dataset.sens)
+glm.reduced.last.fit.entire.dataset.metrics
+
+glm.full.reduced.entire.dataset.metrics <- left_join(glm.last.fit.entire.dataset.metrics, glm.reduced.last.fit.entire.dataset.metrics, by = ".metric") %>% rename(Classification_Metric = .metric, Full_Model = .estimate.x, Reduced_Model = .estimate.y)
+glm.full.reduced.entire.dataset.metrics
+
+
+# Penalized Logistic Regression (LASSO) (glmnet) model
+lasso.last.fit.entire.dataset.results <- predict(lasso.final, new_data = baseball.2016 %>% select(-event_binary))
+lasso.last.fit.entire.dataset.results
+lasso.last.fit.entire.dataset.results <- bind_cols(lasso.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+lasso.last.fit.entire.dataset.results
+lasso.last.fit.entire.dataset.conf_mat <- conf_mat(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+lasso.last.fit.entire.dataset.conf_mat
+lasso.last.fit.entire.dataset.mcc <- mcc(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.last.fit.entire.dataset.accuracy <- accuracy(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.last.fit.entire.dataset.spec <- spec(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.last.fit.entire.dataset.sens  <- sens(lasso.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.last.fit.entire.dataset.metrics <- bind_rows(lasso.last.fit.entire.dataset.mcc, lasso.last.fit.entire.dataset.accuracy, lasso.last.fit.entire.dataset.bal.accuracy, lasso.last.fit.entire.dataset.spec, lasso.last.fit.entire.dataset.sens)
+lasso.last.fit.entire.dataset.metrics
+
+lasso.reduced.last.fit.entire.dataset.results <- predict(lasso.reduced.final, new_data = baseball.2016 %>% select(-event_binary))
+lasso.reduced.last.fit.entire.dataset.results
+lasso.reduced.last.fit.entire.dataset.results <- bind_cols(lasso.reduced.last.fit.entire.dataset.results, baseball.2016 %>% select(event_binary))
+lasso.reduced.last.fit.entire.dataset.results
+lasso.reduced.last.fit.entire.dataset.conf_mat <- conf_mat(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class)
+lasso.reduced.last.fit.entire.dataset.conf_mat
+lasso.reduced.last.fit.entire.dataset.mcc <- mcc(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.reduced.last.fit.entire.dataset.accuracy <- accuracy(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.reduced.last.fit.entire.dataset.bal.accuracy <- bal_accuracy(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.reduced.last.fit.entire.dataset.spec <- spec(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.reduced.last.fit.entire.dataset.sens  <- sens(lasso.reduced.last.fit.entire.dataset.results, truth = event_binary, estimate = .pred_class) %>% select(-.estimator)
+lasso.reduced.last.fit.entire.dataset.metrics <- bind_rows(lasso.reduced.last.fit.entire.dataset.mcc, lasso.reduced.last.fit.entire.dataset.accuracy, lasso.reduced.last.fit.entire.dataset.bal.accuracy, lasso.reduced.last.fit.entire.dataset.spec, lasso.reduced.last.fit.entire.dataset.sens)
+lasso.reduced.last.fit.entire.dataset.metrics
+
+lasso.full.reduced.entire.dataset.metrics <- left_join(lasso.last.fit.entire.dataset.metrics, lasso.reduced.last.fit.entire.dataset.metrics, by = ".metric") %>% rename(Classification_Metric = .metric, Full_Model = .estimate.x, Reduced_Model = .estimate.y)
+lasso.full.reduced.entire.dataset.metrics
+
+
+tree.glm.entire.dataset.metrics <- left_join(tree.full.reduced.entire.dataset.metrics, glm.full.reduced.entire.dataset.metrics, by = "Classification_Metric") %>%
+  rename(Tree_Full = Full_Model.x, Tree_Reduced = Reduced_Model.x, GLM_Full = Full_Model.y, GLM_Reduced = Reduced_Model.y)
+tree.glm.entire.dataset.metrics
+
+tree.glm.lasso.entire.dataset.metrics <- left_join(tree.glm.entire.dataset.metrics, lasso.full.reduced.entire.dataset.metrics, by = "Classification_Metric") %>%
+  rename(LASSO_Full = Full_Model, LASSO_Reduced = Reduced_Model)
+tree.glm.lasso.entire.dataset.metrics
+
+```
+
